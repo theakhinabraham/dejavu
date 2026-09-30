@@ -70,6 +70,16 @@ export type PlanningFields = {
 };
 export type InterpretResponse = {
   session_id: string;
+  session_state: {
+    fields: Record<string, InterpretedValue>;
+    unresolved: string[];
+    assumptions: string[];
+    corrections: string[];
+    turns: number;
+    awaiting_confirmation: boolean;
+    confirming_field: string | null;
+    prompted_field: string | null;
+  };
   active: boolean;
   fields: PlanningFields;
   unresolved: string[];
@@ -81,13 +91,19 @@ export type InterpretResponse = {
   assistant_message?: string | null;
 };
 
-const API_BASE = import.meta.env.VITE_API_URL ?? '';
+// Keep API calls same-origin: Vercel routes /api/* to the backend service,
+// while the local Vite dev server proxies the same paths to FastAPI.
+const API_BASE = '';
 
-export async function interpretChatTurn(sessionId: string, text: string): Promise<InterpretResponse> {
+export async function interpretChatTurn(
+  sessionId: string,
+  text: string,
+  sessionState: InterpretResponse['session_state'] | null,
+): Promise<InterpretResponse> {
   const response = await fetch(`${API_BASE}/api/chat/interpret`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sessionId, text }),
+    body: JSON.stringify({ session_id: sessionId, text, session_state: sessionState }),
     signal: AbortSignal.timeout(12_000),
   }).catch(() => { throw new Error('Could not reach the conversation interpreter. Check that the backend is running on port 8000.'); });
   if (!response.ok) throw new Error(`The conversation interpreter returned HTTP ${response.status}. Please try again.`);

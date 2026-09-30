@@ -24,11 +24,6 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 
-class InterpretRequest(BaseModel):
-    session_id: str = Field(min_length=1, max_length=80)
-    text: str = Field(min_length=1, max_length=2000)
-
-
 class ExtractedValue(BaseModel):
     value: str | int | float
     confidence: float = Field(ge=0, le=1)
@@ -46,8 +41,27 @@ class PlanningFields(BaseModel):
     consistency_pattern: ExtractedValue | None = None
 
 
+class InterpretSessionState(BaseModel):
+    """Client-carried state so multi-turn interpretation works on serverless runtimes."""
+    fields: dict[str, ExtractedValue] = Field(default_factory=dict)
+    unresolved: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    corrections: list[str] = Field(default_factory=list)
+    turns: int = 0
+    awaiting_confirmation: bool = False
+    confirming_field: str | None = None
+    prompted_field: str | None = None
+
+
+class InterpretRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=2000)
+    session_state: InterpretSessionState | None = None
+
+
 class InterpretResponse(BaseModel):
     session_id: str
+    session_state: InterpretSessionState
     active: bool
     fields: PlanningFields
     unresolved: list[str]
@@ -260,6 +274,23 @@ def _typed_fields(fields: dict[str, ExtractedValue]) -> PlanningFields:
     return PlanningFields(**fields)
 
 
+def _snapshot(state: _Session) -> InterpretSessionState:
+    return InterpretSessionState(
+        fields=state.fields,
+        unresolved=state.unresolved,
+        assumptions=state.assumptions,
+        corrections=state.corrections,
+        turns=state.turns,
+        awaiting_confirmation=state.awaiting_confirmation,
+        confirming_field=state.confirming_field,
+        prompted_field=state.prompted_field,
+    )
+
+
+def _response(session_id: str, state: _Session, **values) -> InterpretResponse:
+    return InterpretResponse(session_id=session_id, session_state=_snapshot(state), **values)
+
+
 def interpret_turn(request: InterpretRequest) -> InterpretResponse:
     now = time.monotonic()
     for key, state in list(_SESSIONS.items()):
@@ -268,7 +299,21 @@ def interpret_turn(request: InterpretRequest) -> InterpretResponse:
     if request.session_id not in _SESSIONS and len(_SESSIONS) >= _MAX_SESSIONS:
         oldest = min(_SESSIONS, key=lambda key: _SESSIONS[key].last_seen)
         del _SESSIONS[oldest]
-    state = _SESSIONS.setdefault(request.session_id, _Session())
+    if request.session_state is not None:
+        saved = request.session_state
+        state = _Session(
+            fields=saved.fields.copy(),
+            unresolved=saved.unresolved.copy(),
+            assumptions=saved.assumptions.copy(),
+            corrections=saved.corrections.copy(),
+            turns=saved.turns,
+            awaiting_confirmation=saved.awaiting_confirmation,
+            confirming_field=saved.confirming_field,
+            prompted_field=saved.prompted_field,
+        )
+    else:
+        state = _SESSIONS.get(request.session_id, _Session())
+    _SESSIONS[request.session_id] = state
     state.last_seen = now
     state.turns += 1
 
@@ -279,7 +324,7 @@ def interpret_turn(request: InterpretRequest) -> InterpretResponse:
         and bool(re.search(r"\b(?:assignments?|coursework|exam|study|work)\b", lower_text))
     )
     if not relevant and not state.fields:
-        return InterpretResponse(session_id=request.session_id, active=False, fields=PlanningFields(), unresolved=[], assumptions=[], corrections=[], needs_confirmation=False, ready=False)
+        return _response(request.session_id, state, active=False, fields=PlanningFields(), unresolved=[], assumptions=[], corrections=[], needs_confirmation=False, ready=False)
 
     for name, (value, confidence, source) in extracted.items():
         old = state.fields.get(name)
@@ -311,13 +356,13 @@ def interpret_turn(request: InterpretRequest) -> InterpretResponse:
         field_name = state.confirming_field
         state.confirming_field = None
         state.prompted_field = field_name
-        return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=[field_name], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, summary=_summary(state.fields), assistant_message=f"No problem. {FIELD_QUESTIONS[field_name]}")
+        return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=[field_name], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, summary=_summary(state.fields), assistant_message=f"No problem. {FIELD_QUESTIONS[field_name]}")
     elif state.awaiting_confirmation and affirmative and not extracted:
         state.awaiting_confirmation = False
-        return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=[], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=True, summary=_summary(state.fields), assistant_message="Great, I’ll use that. Let’s compare the two plans.")
+        return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=[], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=True, summary=_summary(state.fields), assistant_message="Great, I’ll use that. Let’s compare the two plans.")
     if state.awaiting_confirmation and negative and not extracted:
         state.awaiting_confirmation = False
-        return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=["correction"], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, summary=_summary(state.fields), assistant_message="No problem. What did I get wrong? You can just correct that part.")
+        return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=["correction"], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, summary=_summary(state.fields), assistant_message="No problem. What did I get wrong? You can just correct that part.")
 
     missing = [name for name in FIELD_ORDER if name not in state.fields]
     low_confidence = [name for name in FIELD_ORDER if name in state.fields and state.fields[name].confidence < 0.75]
@@ -328,7 +373,7 @@ def interpret_turn(request: InterpretRequest) -> InterpretResponse:
         state.prompted_field = field_name
         summary_so_far = _summary(state.fields).removesuffix(" Does that sound right?")
         message = f"{summary_so_far} Does that sound right so far? {message}"
-        return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=state.unresolved, assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, assistant_message=message)
+        return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=state.unresolved, assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=False, ready=False, assistant_message=message)
     if low_confidence:
         name = low_confidence[0]
         value = state.fields[name].value
@@ -340,7 +385,7 @@ def interpret_turn(request: InterpretRequest) -> InterpretResponse:
             clarification = f"I heard about {value} hours a day. Does that sound right?"
         else:
             clarification = f"I heard {value}. Does that sound right, or would you put it another way?"
-        return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=low_confidence, assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=True, ready=False, summary=_summary(state.fields), assistant_message=clarification)
+        return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=low_confidence, assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=True, ready=False, summary=_summary(state.fields), assistant_message=clarification)
 
     state.awaiting_confirmation = True
-    return InterpretResponse(session_id=request.session_id, active=True, fields=_typed_fields(state.fields), unresolved=[], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=True, ready=False, summary=_summary(state.fields), assistant_message=_summary(state.fields))
+    return _response(request.session_id, state, active=True, fields=_typed_fields(state.fields), unresolved=[], assumptions=state.assumptions, corrections=state.corrections, needs_confirmation=True, ready=False, summary=_summary(state.fields), assistant_message=_summary(state.fields))

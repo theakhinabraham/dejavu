@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { compareDecisions, interpretChatTurn, type DecisionCriterionInput, type DecisionOptionInput, type DecisionResponse } from './api';
+import { compareDecisions, interpretChatTurn, type DecisionCriterionInput, type DecisionOptionInput, type DecisionResponse, type InterpretResponse } from './api';
 import { extractDecisionOptions, optionsRestatement } from './conversation';
 
 type Step = 'decision' | 'options' | 'criteria' | 'estimate' | 'calibration' | 'done';
@@ -195,6 +195,7 @@ function App() {
   const messageListRef = useRef<HTMLDivElement>(null);
   const usedBotPhrases = useRef<Set<string>>(new Set());
   const nluSessionId = useRef(makeSessionId());
+  const nluSessionState = useRef<InterpretResponse['session_state'] | null>(null);
   const [nluSessionActive, setNluSessionActive] = useState(false);
 
   function makeInitialId() {
@@ -280,7 +281,8 @@ function App() {
       let interpretation;
       setLoading(true);
       try {
-        interpretation = await interpretChatTurn(nluSessionId.current, text);
+        interpretation = await interpretChatTurn(nluSessionId.current, text, nluSessionState.current);
+        nluSessionState.current = interpretation.session_state;
       } catch (cause) {
         setLoading(false);
         setError(cause instanceof Error ? cause.message : 'I couldn’t keep the planning details just now. Please try again.');
@@ -427,7 +429,7 @@ function App() {
   function resetChat() {
     setStep('decision'); setConversation(initialConversation); setResult(null); setError(''); setDraft('');
     setChatId(makeInitialId());
-    nluSessionId.current = makeSessionId(); setNluSessionActive(false);
+    nluSessionId.current = makeSessionId(); nluSessionState.current = null; setNluSessionActive(false);
     usedBotPhrases.current.clear();
     setMessages([{ role: 'assistant', text: 'Sure, let’s start fresh. What decision are you weighing? Include the options if you already know them.' }]);
   }
